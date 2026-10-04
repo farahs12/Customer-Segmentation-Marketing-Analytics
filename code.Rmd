@@ -1,0 +1,433 @@
+---
+title: "Customer Segmentation & Marketing Analytics"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Project Overview
+
+This project analyzes customer subscription behavior to identify meaningful customer segments and evaluate the effectiveness of promotional campaigns.
+
+The analysis focuses on three business questions:
+
+1. What types of customers generate the most value?
+2. Which customer segments should be prioritized for retention or upselling?
+3. Which customers continue using an upgraded subscription after receiving a promotion?
+
+The project combines exploratory data analysis, factor analysis, customer segmentation using K-means clustering, demographic profiling, and pre/post campaign analysis.
+
+# Data
+
+The analysis uses four datasets:
+
+- `SocioDemo`: customer demographic information
+- `HoursMusic`: customer music preferences
+- `HistoryData`: longitudinal subscription history
+- `Action120`: promotional actions assigned to customers
+
+```{r data}
+
+load("StudentData.Rdata")
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(factoextra)
+library(psy)
+```
+
+# 1. Preference Dimension Reduction
+
+Customer music preferences contain several correlated dimensions. Factor analysis is used to summarize these preferences into broader behavioral dimensions.
+
+```{r factor-analysis}
+music_only <- HoursMusic[, c(
+  "Mellow",
+  "Unpretentous",
+  "Sophisticated",
+  "Intense",
+  "Contemporary"
+)]
+
+factanal(music_only, factors = 2)
+print(factanal(music_only, factors = 2), cutoff = .6)
+
+cronbach(music_only[, c(1, 2, 5)])
+cronbach(music_only[, c(3, 4)])
+```
+
+Based on the factor structure, two preference scales are constructed.
+
+```{r preference-scales}
+Refined_Passion <- apply(music_only[, 3:4], 1, mean)
+
+Modern_Simplicity <- apply(
+  music_only[, c(1, 2, 5)],
+  1,
+  mean
+)
+```
+
+# 2. Subscription Behavior Over Time
+
+Before segmenting customers, we examine how subscription choices evolve over time.
+
+```{r subscription-behavior}
+total_customers_by_time <- HistoryData %>%
+  group_by(Time) %>%
+  summarise(
+    Total_Customers = n_distinct(ID),
+    .groups = "drop"
+  )
+
+subscription_behavior <- HistoryData %>%
+  group_by(Time, Ad, Choice) %>%
+  summarise(
+    Count = n_distinct(ID),
+    .groups = "drop"
+  ) %>%
+  left_join(total_customers_by_time, by = "Time") %>%
+  mutate(
+    Proportion = Count / Total_Customers,
+    Subscription_Tier = paste("Ad:", Ad, "Choice:", Choice)
+  )
+
+ggplot(
+  subscription_behavior,
+  aes(x = Time, y = Proportion, color = Subscription_Tier)
+) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Subscription Behavior Over Time",
+    x = "Time",
+    y = "Proportion of Customers",
+    color = "Subscription Tier"
+  ) +
+  theme_minimal()
+```
+
+The subscription mix changes over time, suggesting that customers differ in their willingness to pay for additional choice and an ad-free experience. These behavioral differences motivate a customer segmentation analysis.
+
+# 3. Customer Value Segmentation
+
+## Business Objective
+
+The objective is to identify customer groups with different levels of **value** and **loyalty**.
+
+Customer value is represented by average subscription profit, while loyalty is approximated by the length of observed subscription history.
+
+```{r customer-profit}
+plan_profit <- c(
+  "Free" = 1.00,
+  "No Ads" = 1.50,
+  "Choice (with Ads)" = 3.00,
+  "Choice (no Ads)" = 4.50
+)
+
+history_with_profit <- HistoryData %>%
+  mutate(
+    Profit = case_when(
+      Ad == 1 & Choice == 1 ~ plan_profit["Free"],
+      Ad == 1 & Choice == 2 ~ plan_profit["Choice (with Ads)"],
+      Ad == 2 & Choice == 1 ~ plan_profit["No Ads"],
+      Ad == 2 & Choice == 2 ~ plan_profit["Choice (no Ads)"],
+      TRUE ~ plan_profit["Free"]
+    )
+  )
+
+cluster_data <- history_with_profit %>%
+  group_by(ID) %>%
+  summarise(
+    Total_Profit = sum(Profit, na.rm = TRUE),
+    Total_Time = n(),
+    Avg_Profit = mean(Profit, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## K-Means Segmentation
+
+The variables are standardized before clustering so that differences in scale do not dominate the distance calculation.
+
+```{r value-clustering}
+cluster_data_norm <- cluster_data %>%
+  mutate(
+    across(c(Avg_Profit, Total_Time), ~ as.numeric(scale(.x)))
+  )
+
+set.seed(123)
+
+kmeans_result <- kmeans(
+  cluster_data_norm[, c("Avg_Profit", "Total_Time")],
+  centers = 3,
+  nstart = 20
+)
+
+cluster_data$Cluster <- factor(kmeans_result$cluster)
+
+cluster_summary <- cluster_data %>%
+  group_by(Cluster) %>%
+  summarise(
+    Average_Profit = mean(Avg_Profit, na.rm = TRUE),
+    Average_Subscription_Time = mean(Total_Time, na.rm = TRUE),
+    Customers = n(),
+    .groups = "drop"
+  )
+
+cluster_summary
+```
+
+```{r value-cluster-plot}
+ggplot(
+  cluster_data,
+  aes(
+    x = Avg_Profit,
+    y = Total_Time,
+    color = Cluster
+  )
+) +
+  geom_point(alpha = 0.5) +
+  labs(
+    title = "Customer Value and Loyalty Segments",
+    x = "Average Profit",
+    y = "Subscription Duration",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+```
+
+## Customer Profiles
+
+Clustering identifies behavioral groups, but business decisions require understanding who those customers are. The cluster assignments are therefore combined with demographic and preference information.
+
+```{r customer-profiles}
+preference_data <- HoursMusic %>%
+  mutate(
+    Refined_Passion = Refined_Passion,
+    Modern_Simplicity = Modern_Simplicity
+  )
+
+cluster_with_demo <- cluster_data %>%
+  left_join(preference_data, by = "ID") %>%
+  left_join(SocioDemo, by = "ID")
+
+cluster_demo_summary <- cluster_with_demo %>%
+  group_by(Cluster) %>%
+  summarise(
+    Average_Profit = mean(Avg_Profit, na.rm = TRUE),
+    Average_Subscription_Time = mean(Total_Time, na.rm = TRUE),
+    Average_Age = mean(Age, na.rm = TRUE),
+    Average_Income = mean(Salary, na.rm = TRUE),
+    Female_Percentage = mean(Woman, na.rm = TRUE) * 100,
+    Most_Common_City =
+      names(sort(table(City), decreasing = TRUE))[1],
+    Most_Common_Education =
+      names(sort(table(Education), decreasing = TRUE))[1],
+    Average_Refined_Passion =
+      mean(Refined_Passion, na.rm = TRUE),
+    Average_Modern_Simplicity =
+      mean(Modern_Simplicity, na.rm = TRUE),
+    Customers = n(),
+    .groups = "drop"
+  )
+
+cluster_demo_summary
+```
+
+## Business Interpretation
+
+The resulting segments can support differentiated strategies.
+
+- **High-value customers with shorter subscription histories** are important retention targets because losing them would reduce future customer value.
+- **Long-term customers with moderate-to-high profitability** represent a loyal core that can be protected through loyalty benefits.
+- **Lower-value customers** may represent an upselling opportunity when their engagement indicates potential interest in premium subscription features.
+
+The objective is not simply to create clusters, but to translate behavioral differences into actionable customer strategies.
+
+# 4. Promotion Effectiveness
+
+## Business Objective
+
+The second analysis examines customers who received a promotional action and asks whether they continued using the upgraded feature after the promotional period.
+
+```{r promoted-customers}
+promoted_customers <- Action120 %>%
+  filter(Action %in% c(1, 2))
+
+history_filtered <- HistoryData %>%
+  filter(Time >= 120)
+
+baseline_plan <- history_filtered %>%
+  filter(Time == 120) %>%
+  select(
+    ID,
+    Initial_Ad = Ad,
+    Initial_Choice = Choice
+  )
+
+history_with_baseline <- history_filtered %>%
+  left_join(baseline_plan, by = "ID")
+
+merged_data <- promoted_customers %>%
+  inner_join(history_with_baseline, by = "ID")
+```
+
+Only customers who were not already using the promoted feature are considered eligible.
+
+```{r eligible-customers}
+eligible_customers <- merged_data %>%
+  filter(
+    (Action == 1 & Initial_Ad == 1) |
+    (Action == 2 & Initial_Choice == 1)
+  )
+
+eligible_customers %>%
+  group_by(Action) %>%
+  summarise(
+    Eligible_Customers = n_distinct(ID),
+    .groups = "drop"
+  )
+```
+
+# 5. Post-Promotion Retention
+
+For each customer, we calculate how long an upgraded subscription is sustained after the promotional period.
+
+```{r upgrade-duration}
+upgrade_duration <- history_with_baseline %>%
+  filter(Time > 123) %>%
+  arrange(ID, Time) %>%
+  mutate(
+    Sustained_Upgrade = ifelse(
+      Ad > Initial_Ad | Choice > Initial_Choice,
+      1,
+      0
+    )
+  ) %>%
+  group_by(ID) %>%
+  summarise(
+    Total_Upgrade_Duration = sum(Sustained_Upgrade, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+eligible_customer_summary <- eligible_customers %>%
+  distinct(ID, Action) %>%
+  left_join(upgrade_duration, by = "ID") %>%
+  mutate(
+    Total_Upgrade_Duration =
+      replace_na(Total_Upgrade_Duration, 0)
+  )
+```
+
+```{r promotion-summary}
+eligible_customer_summary %>%
+  group_by(Action) %>%
+  summarise(
+    Customers = n(),
+    Average_Upgrade_Duration =
+      mean(Total_Upgrade_Duration, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+# 6. Promotion Response Segmentation
+
+Customers receiving each promotional action can be grouped according to the duration for which they maintain the upgrade.
+
+```{r promotion-clustering}
+perform_promotion_clustering <- function(data, centers = 3) {
+
+  scaled_duration <- scale(data$Total_Upgrade_Duration)
+
+  set.seed(123)
+
+  model <- kmeans(
+    scaled_duration,
+    centers = centers,
+    nstart = 20
+  )
+
+  data %>%
+    mutate(Cluster = factor(model$cluster))
+}
+
+promotion_clusters <- eligible_customer_summary %>%
+  group_by(Action) %>%
+  group_modify(
+    ~ perform_promotion_clustering(.x, centers = 3)
+  ) %>%
+  ungroup()
+
+promotion_clusters %>%
+  left_join(SocioDemo, by = "ID") %>%
+  group_by(Action, Cluster) %>%
+  summarise(
+    Average_Upgrade_Duration =
+      mean(Total_Upgrade_Duration, na.rm = TRUE),
+    Average_Age = mean(Age, na.rm = TRUE),
+    Average_Salary = mean(Salary, na.rm = TRUE),
+    Customers = n(),
+    .groups = "drop"
+  )
+```
+
+# 7. Pre/Post Campaign Profitability
+
+Finally, the analysis compares customer profitability before and after the campaign.
+
+```{r campaign-profitability}
+action_impact <- history_with_profit %>%
+  mutate(
+    Time_Period = case_when(
+      Time < 121 ~ "Pre-Campaign",
+      Time > 123 ~ "Post-Campaign",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Time_Period)) %>%
+  group_by(ID, Time_Period) %>%
+  summarise(
+    Profit = mean(Profit, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = Time_Period,
+    values_from = Profit
+  )
+
+campaign_results <- promotion_clusters %>%
+  left_join(action_impact, by = "ID") %>%
+  group_by(Action, Cluster) %>%
+  summarise(
+    Customers = n(),
+    Average_Upgrade_Duration =
+      mean(Total_Upgrade_Duration, na.rm = TRUE),
+    Pre_Campaign_Profit =
+      mean(`Pre-Campaign`, na.rm = TRUE),
+    Post_Campaign_Profit =
+      mean(`Post-Campaign`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+campaign_results
+```
+
+# 8. Business Recommendations
+
+The analysis illustrates how customer analytics can support marketing and retention decisions.
+
+**Retention:** High-value customers who maintain premium features but have relatively short histories should receive particular attention because retaining them can protect future customer value.
+
+**Upselling:** Engaged customers in lower-profit subscription tiers can be targeted with relevant premium offers rather than applying promotions uniformly across the customer base.
+
+**Campaign targeting:** Promotion response differs across customers. Segment-level response and post-campaign profitability can be used to identify populations for which promotions are most likely to create lasting value.
+
+**Customer strategy:** Combining behavioral, demographic, preference, and profitability information produces more useful customer profiles than relying on a single characteristic.
+
